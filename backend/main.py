@@ -1,8 +1,10 @@
+import json
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from devin_dispatcher import create_devin_session, get_session_status
 from github_client import fetch_open_issues
@@ -87,7 +89,9 @@ async def get_issue_status(issue_id: int) -> Issue:
         else:
             issue.status = IssueStatus.needs_human
             await send_slack_notification(issue)
-    elif (status == "stopped" or status == "failed") and issue.status == IssueStatus.in_progress:
+    elif (
+        status == "stopped" or status == "failed"
+    ) and issue.status == IssueStatus.in_progress:
         issue.status = IssueStatus.needs_human
         await send_slack_notification(issue)
 
@@ -132,3 +136,65 @@ async def dismiss_issue(issue_id: int) -> dict:
     issue.status = IssueStatus.dismissed
     issue_store[issue_id] = issue
     return {"message": f"Issue {issue_id} dismissed"}
+
+
+@app.post("/api/slack/interactions")
+async def handle_slack_interaction(
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> JSONResponse:
+    """Handle Slack interactive message button clicks.
+
+    Slack sends interaction payloads as application/x-www-form-urlencoded
+    with a 'payload' field containing JSON.
+    """
+    form = await request.form()
+    raw_payload = form.get("payload")
+    if not raw_payload:
+        return JSONResponse({"error": "Missing payload"}, status_code=400)
+
+    payload = json.loads(raw_payload)
+    actions = payload.get("actions", [])
+    if not actions:
+        return JSONResponse({"error": "No actions found"}, status_code=400)
+
+    action = actions[0]
+    action_id: str = action.get("action_id", "")
+    issue_id = int(action.get("value", 0))
+
+    if issue_id not in issue_store:
+        return JSONResponse({"text": "Issue not found."}, status_code=200)
+
+    issue = issue_store[issue_id]
+
+    if action_id.startswith("override_issue_"):
+        if issue.status != IssueStatus.needs_human:
+            return JSONResponse(
+                {"text": f"Issue #{issue.number} is no longer awaiting review."},
+                status_code=200,
+            )
+        issue.status = IssueStatus.in_progress
+        issue_store[issue_id] = issue
+
+        async def _dispatch_override() -> None:
+            try:
+                session_id = await create_devin_session(issue)
+                issue.devin_session_id = session_id
+            except Exception:
+                issue.status = IssueStatus.needs_human
+
+        background_tasks.add_task(_dispatch_override)
+        return JSONResponse(
+            {"text": f"Issue #{issue.number} overridden — dispatching to Devin."},
+            status_code=200,
+        )
+
+    elif action_id.startswith("dismiss_issue_"):
+        issue.status = IssueStatus.dismissed
+        issue_store[issue_id] = issue
+        return JSONResponse(
+            {"text": f"Issue #{issue.number} dismissed."},
+            status_code=200,
+        )
+
+    return JSONResponse({"text": "Unknown action."}, status_code=200)

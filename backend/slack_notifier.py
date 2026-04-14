@@ -47,7 +47,7 @@ def _build_pr_opened_message(issue: Issue) -> dict:
 
 
 def _build_needs_human_message(issue: Issue, base_url: str) -> dict:
-    """Build a Slack message for a needs_human event with action buttons."""
+    """Build a Slack message for a needs_human event with interactive buttons."""
     return {
         "text": f"🚨 Issue #{issue.number} needs human review: {issue.title}",
         "blocks": [
@@ -69,13 +69,15 @@ def _build_needs_human_message(issue: Issue, base_url: str) -> dict:
                         "type": "button",
                         "text": {"type": "plain_text", "text": "Automate it"},
                         "style": "primary",
-                        "url": f"{base_url}/api/issues/{issue.id}/override",
+                        "action_id": f"override_issue_{issue.id}",
+                        "value": str(issue.id),
                     },
                     {
                         "type": "button",
                         "text": {"type": "plain_text", "text": "Dismiss"},
                         "style": "danger",
-                        "url": f"{base_url}/api/issues/{issue.id}/dismiss",
+                        "action_id": f"dismiss_issue_{issue.id}",
+                        "value": str(issue.id),
                     },
                 ],
             },
