@@ -74,7 +74,7 @@ async def get_issue_status(issue_id: int) -> Issue:
         return issue
 
     status = session_data.get("status", "")
-    if status == "finished":
+    if status == "finished" and issue.status == IssueStatus.in_progress:
         # Check if a PR was opened based on structured output or URL
         pr_url = session_data.get("structured_output", {}).get("pr_url")
         if not pr_url:
@@ -87,7 +87,7 @@ async def get_issue_status(issue_id: int) -> Issue:
         else:
             issue.status = IssueStatus.needs_human
             await send_slack_notification(issue)
-    elif status == "stopped" or status == "failed":
+    elif (status == "stopped" or status == "failed") and issue.status == IssueStatus.in_progress:
         issue.status = IssueStatus.needs_human
         await send_slack_notification(issue)
 
