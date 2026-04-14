@@ -62,12 +62,24 @@ export default function IssueCard({ issue, accent }: IssueCardProps) {
           >
             #{issue.number}
           </span>
-          <h3
-            className="leading-tight mt-1 truncate"
-            style={{ fontSize: "13px", fontWeight: 500, color: "#e2e4ea" }}
+          <a
+            href={`https://github.com/ikc2210/finserv-monorepo-demo/issues/${issue.number}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="leading-tight mt-1 block no-underline hover:opacity-80"
+            style={{
+              fontSize: "13px",
+              fontWeight: 500,
+              color: "#e2e4ea",
+              display: "-webkit-box",
+              WebkitLineClamp: 2,
+              WebkitBoxOrient: "vertical",
+              overflow: "hidden",
+              textDecoration: "none",
+            }}
           >
             {issue.title}
-          </h3>
+          </a>
         </div>
         {issue.status === "in_progress" && (
           <div className="ml-3 flex-shrink-0">
