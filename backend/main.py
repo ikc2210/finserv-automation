@@ -1,23 +1,104 @@
-import json
+import asyncio
+import logging
+import os
+import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from devin_dispatcher import create_devin_session, get_session_status
 from github_client import fetch_open_issues
 from models import Issue, IssueStatus
 from slack_notifier import send_slack_notification
 
+
+
 # In-memory issue store keyed by issue ID
 issue_store: dict[int, Issue] = {}
 
 
+_POLL_INTERVAL = 30.0  # seconds between status checks
+
+
+def _parse_devin_assessment(messages: list[dict]) -> tuple[str, int]:
+    """Extract complexity (low/medium/high) and risk_score (1-10) from Devin's last message."""
+    text = ""
+    for msg in reversed(messages):
+        if msg.get("type") == "devin_message":
+            text = msg.get("message", "")
+            break
+    if not text:
+        return "low", 0
+
+    complexity = "low"
+    m = re.search(r"complexity[:\s*]+(\w+)", text, re.IGNORECASE)
+    if m and m.group(1).lower() in ("high", "medium", "low"):
+        complexity = m.group(1).lower()
+
+    risk_score = 0
+    m = re.search(r"risk[:\s*]+(\d+)(?:/10)?", text, re.IGNORECASE)
+    if m:
+        risk_score = min(10, max(0, int(m.group(1))))
+
+    return complexity, risk_score
+
+
+def _is_flagged_for_human(messages: list[dict]) -> bool:
+    """Return True if Devin's last message flags the issue for human review."""
+    for msg in reversed(messages):
+        if msg.get("type") == "devin_message":
+            text = msg.get("message", "").lower()
+            return bool(re.search(r"flag|human review", text))
+    return False
+
+
+async def _poll_in_progress_issues() -> None:
+    """Background task that polls Devin for all in-progress issues."""
+    while True:
+        await asyncio.sleep(_POLL_INTERVAL)
+        in_progress = [
+            issue for issue in issue_store.values()
+            if issue.status == IssueStatus.in_progress and issue.devin_session_id
+        ]
+        for issue in in_progress:
+            try:
+                session_data = await get_session_status(issue.devin_session_id)
+            except Exception as e:
+                logger.warning("Failed to poll Devin for issue #%s: %s", issue.number, e)
+                continue
+
+            status_enum = session_data.get("status_enum", "")
+            pr_url = (session_data.get("pull_request") or {}).get("url")
+            messages = session_data.get("messages", [])
+
+            complexity, risk_score = _parse_devin_assessment(messages)
+            issue.complexity = complexity
+            issue.risk_score = risk_score
+
+            if pr_url:
+                issue.status = IssueStatus.pr_opened
+                issue.pr_url = pr_url
+                await send_slack_notification(issue)
+            elif status_enum in ("blocked", "stopped", "failed") or _is_flagged_for_human(messages):
+                issue.status = IssueStatus.needs_human
+                await send_slack_notification(issue)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    task = asyncio.create_task(_poll_in_progress_issues())
     yield
+    task.cancel()
     issue_store.clear()
 
 
@@ -38,18 +119,25 @@ async def list_issues() -> list[Issue]:
     return list(issue_store.values())
 
 
+_INTER_ISSUE_DELAY = 30.0  # seconds between Devin session creations
+
+
 async def _run_issue_pipeline() -> None:
     """Fetch GitHub issues and dispatch each to Devin sequentially."""
     issues = await fetch_open_issues()
-    for issue in issues:
+    for i, issue in enumerate(issues):
         issue.status = IssueStatus.in_progress
         issue_store[issue.id] = issue
         try:
-            session_id = await create_devin_session(issue)
+            session_id, session_url = await create_devin_session(issue)
             issue.devin_session_id = session_id
-        except Exception:
+            issue.devin_session_url = session_url
+        except Exception as e:
+            logger.error("Failed to create Devin session for issue #%s: %s", issue.number, e)
             issue.status = IssueStatus.needs_human
             await send_slack_notification(issue)
+        if i < len(issues) - 1:
+            await asyncio.sleep(_INTER_ISSUE_DELAY)
 
 
 @app.post("/api/run")
@@ -75,22 +163,20 @@ async def get_issue_status(issue_id: int) -> Issue:
     except Exception:
         return issue
 
-    status = session_data.get("status", "")
-    if status == "finished" and issue.status == IssueStatus.in_progress:
-        # Check if a PR was opened based on structured output or URL
-        pr_url = session_data.get("structured_output", {}).get("pr_url")
-        if not pr_url:
-            pr_url = session_data.get("result", {}).get("pr_url")
+    status_enum = session_data.get("status_enum", "")
+    pr_url = (session_data.get("pull_request") or {}).get("url")
+    messages = session_data.get("messages", [])
 
-        if pr_url:
-            issue.status = IssueStatus.pr_opened
-            issue.pr_url = pr_url
-            await send_slack_notification(issue)
-        else:
-            issue.status = IssueStatus.needs_human
-            await send_slack_notification(issue)
+    complexity, risk_score = _parse_devin_assessment(messages)
+    issue.complexity = complexity
+    issue.risk_score = risk_score
+
+    if pr_url and issue.status == IssueStatus.in_progress:
+        issue.status = IssueStatus.pr_opened
+        issue.pr_url = pr_url
+        await send_slack_notification(issue)
     elif (
-        status == "stopped" or status == "failed"
+        status_enum in ("blocked", "stopped", "failed") or _is_flagged_for_human(messages)
     ) and issue.status == IssueStatus.in_progress:
         issue.status = IssueStatus.needs_human
         await send_slack_notification(issue)
@@ -117,8 +203,9 @@ async def override_issue(issue_id: int, background_tasks: BackgroundTasks) -> di
 
     async def _dispatch_override() -> None:
         try:
-            session_id = await create_devin_session(issue)
+            session_id, session_url = await create_devin_session(issue)
             issue.devin_session_id = session_id
+            issue.devin_session_url = session_url
         except Exception:
             issue.status = IssueStatus.needs_human
 
@@ -136,65 +223,3 @@ async def dismiss_issue(issue_id: int) -> dict:
     issue.status = IssueStatus.dismissed
     issue_store[issue_id] = issue
     return {"message": f"Issue {issue_id} dismissed"}
-
-
-@app.post("/api/slack/interactions")
-async def handle_slack_interaction(
-    request: Request,
-    background_tasks: BackgroundTasks,
-) -> JSONResponse:
-    """Handle Slack interactive message button clicks.
-
-    Slack sends interaction payloads as application/x-www-form-urlencoded
-    with a 'payload' field containing JSON.
-    """
-    form = await request.form()
-    raw_payload = form.get("payload")
-    if not raw_payload:
-        return JSONResponse({"error": "Missing payload"}, status_code=400)
-
-    payload = json.loads(raw_payload)
-    actions = payload.get("actions", [])
-    if not actions:
-        return JSONResponse({"error": "No actions found"}, status_code=400)
-
-    action = actions[0]
-    action_id: str = action.get("action_id", "")
-    issue_id = int(action.get("value", 0))
-
-    if issue_id not in issue_store:
-        return JSONResponse({"text": "Issue not found."}, status_code=200)
-
-    issue = issue_store[issue_id]
-
-    if action_id.startswith("override_issue_"):
-        if issue.status != IssueStatus.needs_human:
-            return JSONResponse(
-                {"text": f"Issue #{issue.number} is no longer awaiting review."},
-                status_code=200,
-            )
-        issue.status = IssueStatus.in_progress
-        issue_store[issue_id] = issue
-
-        async def _dispatch_override() -> None:
-            try:
-                session_id = await create_devin_session(issue)
-                issue.devin_session_id = session_id
-            except Exception:
-                issue.status = IssueStatus.needs_human
-
-        background_tasks.add_task(_dispatch_override)
-        return JSONResponse(
-            {"text": f"Issue #{issue.number} overridden — dispatching to Devin."},
-            status_code=200,
-        )
-
-    elif action_id.startswith("dismiss_issue_"):
-        issue.status = IssueStatus.dismissed
-        issue_store[issue_id] = issue
-        return JSONResponse(
-            {"text": f"Issue #{issue.number} dismissed."},
-            status_code=200,
-        )
-
-    return JSONResponse({"text": "Unknown action."}, status_code=200)

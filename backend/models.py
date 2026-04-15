@@ -19,7 +19,11 @@ class Issue(BaseModel):
     body: Optional[str] = None
     url: str
     status: IssueStatus = IssueStatus.flagged
+    labels: list[str] = []
+    risk_score: int = 0
+    complexity: str = "low"
     devin_session_id: Optional[str] = None
+    devin_session_url: Optional[str] = None
     pr_url: Optional[str] = None
 
 

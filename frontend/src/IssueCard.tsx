@@ -1,5 +1,5 @@
 import type { Issue } from "./types";
-import { overrideIssue } from "./api";
+import { overrideIssue, dismissIssue } from "./api";
 
 function labelStyle(label: string): React.CSSProperties {
   switch (label) {
@@ -63,7 +63,7 @@ export default function IssueCard({ issue, accent }: IssueCardProps) {
             #{issue.number}
           </span>
           <a
-            href={`https://github.com/ikc2210/finserv-monorepo-demo/issues/${issue.number}`}
+            href={issue.url}
             target="_blank"
             rel="noopener noreferrer"
             className="leading-tight mt-1 block no-underline hover:opacity-80"
@@ -179,7 +179,7 @@ export default function IssueCard({ issue, accent }: IssueCardProps) {
         )}
         {issue.devin_session_id && (
           <a
-            href={`https://app.devin.ai/sessions/${issue.devin_session_id}`}
+            href={issue.devin_session_url ?? `https://app.devin.ai/sessions/${issue.devin_session_id}`}
             target="_blank"
             rel="noopener noreferrer"
             className="text-xs hover:underline truncate"
@@ -216,6 +216,7 @@ export default function IssueCard({ issue, accent }: IssueCardProps) {
             Automate it
           </button>
           <button
+            onClick={() => dismissIssue(issue.id)}
             className="flex-1 px-3 py-1.5 bg-transparent text-xs rounded transition-all cursor-pointer"
             style={{
               border: "1px solid #4b506050",

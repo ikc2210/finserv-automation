@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import os
 
 import httpx
@@ -5,14 +7,18 @@ import httpx
 from models import Issue
 
 
-DEVIN_API_KEY = os.getenv("DEVIN_API_KEY", "")
 DEVIN_API_BASE = "https://api.devin.ai/v1"
+
+logger = logging.getLogger(__name__)
+
+_MAX_RETRIES = 5
+_BASE_BACKOFF = 60.0  # seconds — Devin rate limit window is on the order of minutes
 
 
 async def create_devin_session(issue: Issue) -> str:
     """Create a Devin session to investigate and potentially fix a GitHub issue.
 
-    Returns the Devin session ID.
+    Returns the Devin session ID. Retries on 429 with Retry-After or exponential backoff.
     """
     prompt = (
         f"Investigate GitHub issue #{issue.number}: {issue.title}\n\n"
@@ -26,21 +32,33 @@ async def create_devin_session(issue: Issue) -> str:
     )
 
     headers = {
-        "Authorization": f"Bearer {DEVIN_API_KEY}",
+        "Authorization": f"Bearer {os.getenv('DEVIN_API_KEY', '')}",
         "Content-Type": "application/json",
     }
     payload = {"prompt": prompt}
 
     async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{DEVIN_API_BASE}/sessions",
-            headers=headers,
-            json=payload,
-        )
-        response.raise_for_status()
-        data = response.json()
+        for attempt in range(_MAX_RETRIES):
+            response = await client.post(
+                f"{DEVIN_API_BASE}/sessions",
+                headers=headers,
+                json=payload,
+            )
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else _BASE_BACKOFF * (2 ** attempt)
+                logger.warning(
+                    "Devin rate limit hit for issue #%s (attempt %d/%d), waiting %.1fs",
+                    issue.number, attempt + 1, _MAX_RETRIES, wait,
+                )
+                await asyncio.sleep(wait)
+                continue
+            response.raise_for_status()
+            data = response.json()
+            logger.info("Devin session created for issue #%s: %s", issue.number, data)
+            return data["session_id"], data.get("url")
 
-    return data["session_id"]
+    raise RuntimeError(f"Devin rate limit exceeded after {_MAX_RETRIES} retries for issue #{issue.number}")
 
 
 async def get_session_status(session_id: str) -> dict:
@@ -49,7 +67,7 @@ async def get_session_status(session_id: str) -> dict:
     Returns the session status data including status and any PR URL.
     """
     headers = {
-        "Authorization": f"Bearer {DEVIN_API_KEY}",
+        "Authorization": f"Bearer {os.getenv('DEVIN_API_KEY', '')}",
         "Accept": "application/json",
     }
 

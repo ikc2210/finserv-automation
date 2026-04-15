@@ -17,3 +17,9 @@ export async function overrideIssue(id: number) {
   if (!res.ok) throw new Error(`Failed to override issue: ${res.status}`);
   return res.json();
 }
+
+export async function dismissIssue(id: number) {
+  const res = await fetch(`${API_BASE}/issues/${id}/dismiss`, { method: "POST" });
+  if (!res.ok) throw new Error(`Failed to dismiss issue: ${res.status}`);
+  return res.json();
+}

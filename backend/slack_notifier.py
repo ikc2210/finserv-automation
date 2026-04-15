@@ -5,14 +5,12 @@ import httpx
 from models import Issue, IssueStatus
 
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
-
-
 async def send_slack_notification(
-    issue: Issue, base_url: str = "http://localhost:8000"
+    issue: Issue, base_url: str = "http://localhost:5173"
 ) -> None:
     """Send a Slack notification based on the issue status."""
-    if not SLACK_WEBHOOK_URL:
+    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL", "")
+    if not slack_webhook_url:
         return
 
     if issue.status == IssueStatus.pr_opened:
@@ -23,7 +21,7 @@ async def send_slack_notification(
         return
 
     async with httpx.AsyncClient() as client:
-        await client.post(SLACK_WEBHOOK_URL, json=payload)
+        await client.post(slack_webhook_url, json=payload)
 
 
 def _build_pr_opened_message(issue: Issue) -> dict:
@@ -47,7 +45,7 @@ def _build_pr_opened_message(issue: Issue) -> dict:
 
 
 def _build_needs_human_message(issue: Issue, base_url: str) -> dict:
-    """Build a Slack message for a needs_human event with interactive buttons."""
+    """Build a Slack message for a needs_human event."""
     return {
         "text": f"🚨 Issue #{issue.number} needs human review: {issue.title}",
         "blocks": [
@@ -58,28 +56,10 @@ def _build_needs_human_message(issue: Issue, base_url: str) -> dict:
                     "text": (
                         f"*Needs Human Review*: "
                         f"<{issue.url}|#{issue.number}: {issue.title}>\n\n"
-                        "This issue was flagged as too complex or risky for automated resolution."
+                        f"This issue was flagged as too complex or risky for automated resolution. "
+                        f"<{base_url}|View in dashboard> to override or dismiss."
                     ),
                 },
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Automate it"},
-                        "style": "primary",
-                        "action_id": f"override_issue_{issue.id}",
-                        "value": str(issue.id),
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Dismiss"},
-                        "style": "danger",
-                        "action_id": f"dismiss_issue_{issue.id}",
-                        "value": str(issue.id),
-                    },
-                ],
             },
         ],
     }
