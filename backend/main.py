@@ -31,25 +31,27 @@ _POLL_INTERVAL = 30.0  # seconds between status checks
 
 
 def _parse_devin_assessment(messages: list[dict]) -> tuple[str, int]:
-    """Extract complexity (low/medium/high) and risk_score (1-10) from Devin's last message."""
-    text = ""
-    for msg in reversed(messages):
-        if msg.get("type") == "devin_message":
-            text = msg.get("message", "")
-            break
-    if not text:
-        return "low", 0
+    """Extract complexity (low/medium/high) and risk_score (1-10) from Devin's messages.
 
+    Scans devin_message entries newest-first so the assessment is found even
+    when a later 'Session terminated' message follows it.
+    """
     complexity = "low"
-    m = re.search(r"complexity[:\s*]+(\w+)", text, re.IGNORECASE)
-    if m and m.group(1).lower() in ("high", "medium", "low"):
-        complexity = m.group(1).lower()
-
     risk_score = 0
-    m = re.search(r"risk[:\s*]+(\d+)(?:/10)?", text, re.IGNORECASE)
-    if m:
-        risk_score = min(10, max(0, int(m.group(1))))
-
+    for msg in reversed(messages):
+        if msg.get("type") != "devin_message":
+            continue
+        text = msg.get("message", "")
+        if complexity == "low":
+            m = re.search(r"COMPLEXITY:\s*(low|medium|high)", text, re.IGNORECASE)
+            if m:
+                complexity = m.group(1).lower()
+        if risk_score == 0:
+            m = re.search(r"RISK_SCORE:\s*(\d+)", text, re.IGNORECASE)
+            if m:
+                risk_score = int(m.group(1))
+        if complexity != "low" and risk_score != 0:
+            break
     return complexity, risk_score
 
 
@@ -68,7 +70,9 @@ async def _poll_in_progress_issues() -> None:
         await asyncio.sleep(_POLL_INTERVAL)
         in_progress = [
             issue for issue in issue_store.values()
-            if issue.status == IssueStatus.in_progress and issue.devin_session_id
+            if issue.status in (IssueStatus.in_progress, IssueStatus.pr_opened, IssueStatus.needs_human)
+            and issue.devin_session_id
+            and issue.risk_score == 0
         ]
         for issue in in_progress:
             try:
@@ -84,6 +88,7 @@ async def _poll_in_progress_issues() -> None:
             complexity, risk_score = _parse_devin_assessment(messages)
             issue.complexity = complexity
             issue.risk_score = risk_score
+            print(f"PARSED issue {issue.id}: complexity={complexity} risk={risk_score}")
 
             if pr_url:
                 issue.status = IssueStatus.pr_opened
@@ -92,6 +97,8 @@ async def _poll_in_progress_issues() -> None:
             elif status_enum in ("blocked", "stopped", "failed") or _is_flagged_for_human(messages):
                 issue.status = IssueStatus.needs_human
                 await send_slack_notification(issue)
+
+            issue_store[issue.id] = issue
 
 
 @asynccontextmanager
@@ -125,9 +132,17 @@ _INTER_ISSUE_DELAY = 30.0  # seconds between Devin session creations
 async def _run_issue_pipeline() -> None:
     """Fetch GitHub issues and dispatch each to Devin sequentially."""
     issues = await fetch_open_issues()
-    for i, issue in enumerate(issues):
+
+    # Only process issues not already tracked
+    new_issues = [issue for issue in issues if issue.id not in issue_store]
+
+    # Add new issues to the store immediately so the frontend shows them
+    for issue in new_issues:
         issue.status = IssueStatus.in_progress
         issue_store[issue.id] = issue
+
+    # Dispatch to Devin sequentially with rate-limit delay
+    for i, issue in enumerate(new_issues):
         try:
             session_id, session_url = await create_devin_session(issue)
             issue.devin_session_id = session_id
@@ -136,7 +151,7 @@ async def _run_issue_pipeline() -> None:
             logger.error("Failed to create Devin session for issue #%s: %s", issue.number, e)
             issue.status = IssueStatus.needs_human
             await send_slack_notification(issue)
-        if i < len(issues) - 1:
+        if i < len(new_issues) - 1:
             await asyncio.sleep(_INTER_ISSUE_DELAY)
 
 
@@ -223,3 +238,12 @@ async def dismiss_issue(issue_id: int) -> dict:
     issue.status = IssueStatus.dismissed
     issue_store[issue_id] = issue
     return {"message": f"Issue {issue_id} dismissed"}
+
+
+@app.get("/api/debug/sessions")
+async def debug_sessions() -> dict:
+    return {
+        str(id): {"session_id": issue.devin_session_id, "status": issue.status}
+        for id, issue in issue_store.items()
+        if issue.devin_session_id
+    }

@@ -28,7 +28,10 @@ async def create_devin_session(issue: Issue) -> str:
         "1. Assess the complexity (low, medium, high) and risk (1-10 scale) of this issue.\n"
         "2. If complexity is low or medium AND risk is below 7, implement a fix and open a PR.\n"
         "3. If complexity is high OR risk is 7 or above, flag the issue for human review.\n"
-        "4. Provide a brief explanation of your assessment."
+        "4. Provide a brief explanation of your assessment.\n\n"
+        "At the end of your final message, output your assessment in exactly this format:\n"
+        "COMPLEXITY: <low|medium|high>\n"
+        "RISK_SCORE: <1-10>"
     )
 
     headers = {
